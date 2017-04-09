@@ -1,0 +1,315 @@
+
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Mastodon Setup.md</title><style></style></head><body id="preview">
+<h1><a id="Mastodon_Setup_0"></a>Mastodon Setup</h1>
+<p>Howdy, stranger! This document is the other half of this video, in which I set up a single-server instance of Mastodon. This was assembled on 9 April 2017, and there’s a good chance that some of the specifics here will change over time. I’ll keep an updated version up on <a href="https://wogan.blog">wogan.blog</a>.</p>
+<h2><a id="0_PrePrerequisites_4"></a>0. Pre-Prerequisites</h2>
+<p>At a bare minimum, you’re going to need:</p>
+<ul>
+<li>A domain name, with the ability to add an A record yourself</li>
+<li>A free <a href="http://mailgun.com">mailgun.com</a> account, with the account verified and your sandbox enabled to send to you</li>
+<li>A 1GB RAM machine with decent network access. This document uses a <a href="https://m.do.co/c/c0648e7493e2">DigitalOcean</a> VM.</li>
+</ul>
+<p>This setup procedure skips a few things that you may want to do on a “productionized” or “community” instance of Mastodon, such as configuring S3 file storage, or using a non-sandbox email send account. You may also want a beefier machine than just 1GB RAM.</p>
+<p>For reference, the OS version in use is <code>Ubuntu 16.04.2 LTS</code> and all the commands are being run from the <code>root</code> user unless explicitly specified.</p>
+<h2><a id="1_Getting_started_16"></a>1. Getting started!</h2>
+<p>The first couple steps:</p>
+<ul>
+<li>Create the VM</li>
+<li>Point your domain to it immediately, by setting the A record to the public IP</li>
+<li>Log into the VM</li>
+<li>Set your root password</li>
+<li>Create a new Mastodon user: <code>adduser mastodon</code></li>
+<li>Update the apt cache: <code>apt-get update</code></li>
+</ul>
+<h2><a id="2_Install_Prerequisites_27"></a>2. Install Prerequisites</h2>
+<p>Now we’ll grab all the prerequisite software packages in one go:</p>
+<pre><code>apt-get install imagemagick ffmpeg libpq-dev libxml2-dev libxslt1-dev nodejs file git curl redis-server redis-tools postgresql postgresql-contrib autoconf bison build-essential libssl-dev libyaml-dev libreadline6-dev zlib1g-dev libncurses5-dev libffi-dev libgdbm3 libgdbm-dev git-core letsencrypt nginx
+</code></pre>
+<p>That’ll take a little while to run. When it’s done, you’ll need Node (version 4) and yarn:</p>
+<pre><code>curl -sL https://deb.nodesource.com/setup_4.x | bash -
+apt-get install nodejs
+npm install -g yarn
+</code></pre>
+<p>You’ll also want to be sure that redis is running, so do:</p>
+<pre><code>service redis-server start
+</code></pre>
+<h2><a id="3_Configure_Database_43"></a>3. Configure Database</h2>
+<p>With Postgres installed, you need to create a new user. Drop into the postgres user and create a mastodon account:</p>
+<pre><code>su - postgres
+psql
+CREATE USER mastodon CREATEDB;
+\q
+exit
+</code></pre>
+<p>Later on we’ll configure mastodon to use that.</p>
+<h2><a id="4_Generate_SSL_certificate_55"></a>4. Generate SSL certificate</h2>
+<p>Before configuring nginx, we can generate the files we’ll need to support SSL. First, kill nginx:</p>
+<pre><code>service nginx stop
+</code></pre>
+<p>Now proceed through the LetsEncrypt process:</p>
+<ul>
+<li>Run <code>letsencrypt certonly</code></li>
+<li>Enter your email address</li>
+<li>Read and acknowledge the terms</li>
+<li>Enter the domain name you chose</li>
+</ul>
+<p>If the domain name has propagated (which is why it’s important to do this early), LetsEncrypt will find your server and issue the certificate in one go. If this step fails, you may need to wait a while longer for your domain to propagate so that LetsEncrypt can see it.</p>
+<h2><a id="5_Configure_nginx_70"></a>5. Configure nginx</h2>
+<p>With the SSL cert done, time to configure nginx!</p>
+<pre><code>cd /etc/nginx/sites-available
+nano mastodon
+</code></pre>
+<p>Simply substitute your domain name where it says <code>example.com</code> in this snippet (lines 9, 15, 23, 24), then paste the entire thing into the file and save it.</p>
+<pre><code>map $http_upgrade $connection_upgrade {
+  default upgrade;
+  ''      close;
+}
+
+server {
+  listen 80;
+  listen [::]:80;
+  server_name example.com;
+  return 301 https://$host$request_uri;
+}
+
+server {
+  listen 443 ssl;
+  server_name example.com;
+
+  ssl_protocols TLSv1.2;
+  ssl_ciphers EECDH+AESGCM:EECDH+AES;
+  ssl_ecdh_curve prime256v1;
+  ssl_prefer_server_ciphers on;
+  ssl_session_cache shared:SSL:10m;
+
+  ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
+
+  keepalive_timeout    70;
+  sendfile             on;
+  client_max_body_size 0;
+  gzip off;
+
+  root /home/mastodon/live/public;
+
+  add_header Strict-Transport-Security &quot;max-age=31536000; includeSubDomains&quot;;
+
+  location / {
+    try_files $uri @proxy;
+  }
+
+  location @proxy {
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+
+    proxy_pass_header Server;
+
+    proxy_pass http://localhost:3000;
+    proxy_buffering off;
+    proxy_redirect off;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+
+    tcp_nodelay on;
+  }
+
+  location /api/v1/streaming {
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+
+    proxy_pass http://localhost:4000;
+    proxy_buffering off;
+    proxy_redirect off;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+
+    tcp_nodelay on;
+  }
+
+  error_page 500 501 502 503 504 /500.html;
+}
+</code></pre>
+<p>Once you’ve saved and closed the file, enable it by creating a symlink:</p>
+<pre><code>ln -s /etc/nginx/sites-available/mastodon /etc/nginx/sites-enabled/mastodon
+</code></pre>
+<p>Then test that the file is OK by running <code>nginx -t</code>. If it reports any errors, you’ll want to fix them before moving on. If the file comes back OK, fire it up!</p>
+<pre><code>service nginx start
+</code></pre>
+<p>Open a browser tab and navigate to your domain. You should get a 502 Gateway Error, secured with your LetsEncrypt cert. If not, go back and make sure you’ve followed every preceding step correctly.</p>
+<h2><a id="6_Configure_Systemd_164"></a>6. Configure Systemd</h2>
+<p>Mastodon consists of 3 services (web, sidekiq and streaming), and we need to create config files for each. You can use the code straight from this page, as-is.</p>
+<pre><code>cd /etc/systemd/system/
+</code></pre>
+<p>The first file is called <code>mastodon-web.service</code> and consists of the following:</p>
+<pre><code>[Unit]
+Description=mastodon-web
+After=network.target
+
+[Service]
+Type=simple
+User=mastodon
+WorkingDirectory=/home/mastodon/live
+Environment=&quot;RAILS_ENV=production&quot;
+Environment=&quot;PORT=3000&quot;
+ExecStart=/home/mastodon/.rbenv/shims/bundle exec puma -C config/puma.rb
+TimeoutSec=15
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+</code></pre>
+<p>The next file is called <code>mastodon-sidekiq.service</code> and consists of the following:</p>
+<pre><code>[Unit]
+Description=mastodon-sidekiq
+After=network.target
+
+[Service]
+Type=simple
+User=mastodon
+WorkingDirectory=/home/mastodon/live
+Environment=&quot;RAILS_ENV=production&quot;
+Environment=&quot;DB_POOL=5&quot;
+ExecStart=/home/mastodon/.rbenv/shims/bundle exec sidekiq -c 5 -q default -q mailers -q pull -q push
+TimeoutSec=15
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+</code></pre>
+<p>The final file is called <code>mastodon-streaming.service</code> and consists of the following:</p>
+<pre><code>[Unit]
+Description=mastodon-streaming
+After=network.target
+
+[Service]
+Type=simple
+User=mastodon
+WorkingDirectory=/home/mastodon/live
+Environment=&quot;NODE_ENV=production&quot;
+Environment=&quot;PORT=4000&quot;
+ExecStart=/usr/bin/npm run start
+TimeoutSec=15
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+</code></pre>
+<p>Once all those are saved, we’ve done all we can with the root user for now.</p>
+<h2><a id="7_Switch_to_the_Mastodon_user_229"></a>7. Switch to the Mastodon user</h2>
+<p>If you haven’t yet logged into the server as <code>mastodon</code>, do so now in a second SSH window. We’re going to set up ruby and pull down the actual Mastodon code here.</p>
+<h2><a id="8_Install_rbenv_rbenvbuild_and_Ruby_233"></a>8. Install rbenv, rbenv-build and Ruby</h2>
+<p>As the <code>mastodon</code> user, clone the rbenv repo into your home folder:</p>
+<pre><code>git clone https://github.com/rbenv/rbenv.git ~/.rbenv
+</code></pre>
+<p>When that’s done, link the bin folder to your PATH:</p>
+<pre><code>echo 'export PATH=&quot;$HOME/.rbenv/bin:$PATH&quot;' &gt;&gt; ~/.bash_profile
+</code></pre>
+<p>Then add the init script to your profile:</p>
+<pre><code>echo 'eval &quot;$(rbenv init -)&quot;' &gt;&gt; ~/.bash_profile
+</code></pre>
+<p>That line is valid for the OS we’re on (Ubuntu 16.04 LTS) but it may differ slightly for you. You can run <code>~/.rbenv/bin/rbenv init</code> to check what line you need to use.</p>
+<p>Once you’ve saved that, log out of the mastodon user, then log back in to complete the rest of this section.</p>
+<p>Install the ruby-build plugin like so:</p>
+<pre><code>git clone https://github.com/rbenv/ruby-build.git ~/.rbenv/plugins/ruby-build
+</code></pre>
+<p>Then install Ruby proper:</p>
+<pre><code>rbenv install 2.3.1
+</code></pre>
+<p>This could take up to 15 minutes to run!</p>
+<p>When it’s done, change to your home folder and clone the Mastodon source:</p>
+<pre><code>cd ~
+git clone https://github.com/tootsuite/mastodon.git live
+cd live
+</code></pre>
+<p>Next up, dependencies! Always more dependencies - we’ll install bundler, then use that to install everything else:</p>
+<pre><code>gem install bundler
+bundle install --deployment --without development test
+yarn install
+</code></pre>
+<p>If all of those succeeded, we’re ready to configure!</p>
+<h2><a id="9_Configure_Mastodon_275"></a>9. Configure Mastodon</h2>
+<p>Before diving into the configuration file, generate 3 secret strings by running this command 3 times:</p>
+<pre><code>bundle exec rake secret
+</code></pre>
+<p>Copy those out to a text file - you’ll paste them back in later. Create the config file by copying the template, then editing it with nano:</p>
+<pre><code>cp .env.production.sample .env.production
+nano .env.production
+</code></pre>
+<p>Inside this file we’re going to make several quick changes.</p>
+<pre><code>REDIS_HOST=localhost
+DB_HOST=/var/run/postgresql
+DB_USER=mastodon
+DB_NAME=mastodon_production
+</code></pre>
+<p>To enable federation, you need to set your domain name here:</p>
+<pre><code>LOCAL_DOMAIN=example.com
+</code></pre>
+<p>Then, for these 3, paste in each key you generated earlier:</p>
+<pre><code>PAPERCLIP_SECRET=
+SECRET_KEY_BASE=
+OTP_SECRET=
+</code></pre>
+<p>Finally, configure your SMTP details:</p>
+<pre><code>SMTP_LOGIN= (whatever your mailgun is)
+SMTP_PASSWORD= (whatever your mailgun is)
+</code></pre>
+<p>Save and close the file.</p>
+<h2><a id="10_Run_installer_310"></a>10. Run installer</h2>
+<p>If you’ve done everything correctly, this command will install the database:</p>
+<pre><code>RAILS_ENV=production bundle exec rails db:setup
+</code></pre>
+<p>If that passes successfully (it’ll echo out every command it runs), you can then precompile the site assets, which may take a few minutes:</p>
+<pre><code>RAILS_ENV=production bundle exec rails assets:precompile
+</code></pre>
+<p>At this point, we’re almost ready to go!</p>
+<h2><a id="11_Configure_cronjob_322"></a>11. Configure cronjob</h2>
+<p>This is technically optional, but highly recommended to keep your instance in good order. As the <code>mastodon</code> user, start by determining where your bundle command lives:</p>
+<pre><code>which bundle
+</code></pre>
+<p>That path will be substituted for <code>$bundle</code>. Now, edit your own crontab:</p>
+<pre><code>crontab -e
+</code></pre>
+<p>Select nano (2) if you’re prompted. Paste in the following lines, making sure to substitute <code>$bundle</code> for the path you got with <code>which bundle</code>:</p>
+<pre><code>5 0 * * * RAILS_ENV=production $bundle exec rake mastodon:media:clear
+10 0 * * * RAILS_ENV=production $bundle exec rake mastodon:push:refresh
+15 0 * * * RAILS_ENV=production $bundle exec rake mastodon:feeds:clear
+</code></pre>
+<p>Those commands will run at 00:05, 00:10 and 00:15 respecively. Save and close the crontab.</p>
+<h2><a id="12_Log_out_and_return_to_root_340"></a>12. Log out and return to root</h2>
+<p>We’re done with the <code>mastodon</code> account. Log out and return to your <code>root</code> shell.</p>
+<h2><a id="13_Start_Mastodon_344"></a>13. Start Mastodon</h2>
+<p>The moment of truth! Enable the Mastodon services (so that they start on boot):</p>
+<pre><code>systemctl enable /etc/systemd/system/mastodon-*.service
+</code></pre>
+<p>Then fire up Mastodon itself:</p>
+<pre><code>systemctl start mastodon-web.service mastodon-sidekiq.service mastodon-streaming.service
+</code></pre>
+<p>Open up a browser tab on your domain. Mastodon can take up to 30 seconds to warm up, so if you see an error page, don’t fret. Only fret if it’s there for longer than a minute - that requires troubleshooting, which is outside the scope of this document.</p>
+<p>You should eventually get a signup page. Congratulations! Register an account for yourself, receive the confirmation email, and activate it.</p>
+<h2><a id="14_Securing_Mastodon_358"></a>14. Securing Mastodon</h2>
+<p>This is by no means a comprehensive guide to server security, but there are two quick things you can change while the root shell is open. Start by editing the passwd file:</p>
+<pre><code>nano /etc/passwd
+</code></pre>
+<p>Find the <code>mastodon</code> entry (it’ll be near the bottom) and replace <code>/bin/bash</code> with <code>/usr/sbin/nologin</code>. Save and quit. This will prevent anyone from logging in as the mastodon user.</p>
+<p>Next, configure ufw. First check if it’s disabled:</p>
+<pre><code>ufw status
+</code></pre>
+<p>It should be off, since this is a brand new VM. Configure it to allow SSH (port 22) and HTTPS (port 443), then turn it on:</p>
+<pre><code>ufw allow 22
+ufw allow 443
+ufw enable
+y
+</code></pre>
+<p>That will prevent any connection attempts on other ports.</p>
+<h2><a id="15_Enjoy_379"></a>15. Enjoy!</h2>
+<p>If you enjoyed this guide, I’d appreciate a follow! You can find me by searching <code>wogan@wogan.im</code> in your Mastodon web UI. Give me a shout if you were able to get an instance set up with these instructions, or if you ran into any problems.</p>
+<h1><a id="Sources_383"></a>Sources</h1>
+<p>A lot of this guide was sourced from the <a href="https://github.com/tootsuite/mastodon/blob/master/docs/Running-Mastodon/Production-guide.md">official Production guide</a> on the Mastodon Github page. I reorded it into a logical sequence after running through it for a few tries.</p>
+
+</body></html>
